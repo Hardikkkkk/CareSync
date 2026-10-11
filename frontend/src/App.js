@@ -6,6 +6,7 @@ import { useMutation, gql } from '@apollo/client';
 import AppHeader from './components/AppHeader';
 import useSmoothScroll from './hooks/useSmoothScroll';
 import CustomCursor from './components/CustomCursor';
+import { warmUp } from './utils/warmUp';
 
 // Each page is its own chunk, so the heavy code (three.js on Home, charts on the
 // manager page) is only downloaded when that page is actually shown.
@@ -73,6 +74,9 @@ function AppRoutes() {
   const [syncError, setSyncError] = useState(null);
   const syncStarted = useRef(false);
 
+  // Wake the backend and database early so the first login is not slow
+  useEffect(() => { warmUp(); }, []);
+
   useEffect(() => {
     if (!isLoading && !isAuthenticated) clearCachedUser();
   }, [isLoading, isAuthenticated]);
@@ -101,6 +105,7 @@ function AppRoutes() {
   }, [isLoading, isAuthenticated, user, createUserIfNotExists]);
 
   // Auth0 is still checking the session, or we are waiting for the user record
+  console.log('DEBUG', { isLoading, isAuthenticated, hasUser: !!loggedInUser, error: syncError?.message });
   if (isLoading || (isAuthenticated && !loggedInUser && !syncError)) {
     return <Splash />;
   }
