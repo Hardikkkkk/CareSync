@@ -4,14 +4,14 @@ import GeofenceScene from './GeofenceScene';
 import ShiftTour from './ShiftTour';
 import LanguageSwitcher from '../components/LanguageSwitcher';
 import Intro from '../components/Intro';
+import ProblemsSection from '../components/ProblemsSection';
 import useScrolled from '../hooks/useScrolled';
 import { useLang } from '../i18n/LanguageContext';
+import { warmUp } from '../utils/warmUp';
 import './Home.css';
 import './Home.motion.css'; // must stay after Home.css
-import ProblemsSection from '../components/ProblemsSection';
 
 const APP_NAME = 'CareSync';
-const PROBLEMS = ['p1', 'p2', 'p3', 'p4'];
 const TRUST = ['t1', 't2', 't3'];
 const FAQ = ['f1', 'f2', 'f3', 'f4'];
 const SECTIONS = [
@@ -98,10 +98,16 @@ export default function Home() {
     return () => { io.disconnect(); root.classList.remove('has-reveal'); };
   }, []);
 
+  // warmUp() wakes the backend and database while the visitor is on Auth0's login page.
   // ui_locales asks Auth0's login screen to use the same language (if enabled in Auth0)
-  const logIn = () => loginWithRedirect({ authorizationParams: { ui_locales: lang } });
-  const signUp = () =>
+  const logIn = () => {
+    warmUp();
+    loginWithRedirect({ authorizationParams: { ui_locales: lang } });
+  };
+  const signUp = () => {
+    warmUp();
     loginWithRedirect({ authorizationParams: { screen_hint: 'signup', ui_locales: lang } });
+  };
 
   // Footer helpers. Text falls back to English until the keys are added to translations.js
   const tr = (key, fallback) => {
@@ -159,7 +165,7 @@ export default function Home() {
 
         <ShiftTour />
 
-   <ProblemsSection />
+        <ProblemsSection />
 
         <section id="views" className="home-section">
           <h2>{t('views.title')}</h2>

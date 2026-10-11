@@ -5,10 +5,24 @@ const { subDays } = require('date-fns');
 
 const prisma = new PrismaClient();
 
+// CHANGED: allowed websites come from the FRONTEND_URLS setting (comma separated),
+// so you can add your Vercel link without editing code.
+// Example: FRONTEND_URLS=https://caresync.vercel.app,https://www.mysite.com
 const allowedOrigins = [
-  'http://localhost:3000',                   // local dev
-  'https://caresync-attendance.onrender.com' // production frontend
+  'http://localhost:3000', // local dev
+  ...(process.env.FRONTEND_URLS || '')
+    .split(',')
+    .map((s) => s.trim().replace(/\/$/, ''))
+    .filter(Boolean),
 ];
+
+// India time (UTC+5:30). Render's servers run in UTC, so "today" must be worked out in IST.
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+function startOfTodayIST() {
+  const d = new Date(Date.now() + IST_OFFSET_MS);
+  d.setUTCHours(0, 0, 0, 0);
+  return new Date(d.getTime() - IST_OFFSET_MS);
+}
 
 // GraphQL schema
 const typeDefs = gql`
@@ -30,8 +44,8 @@ const typeDefs = gql`
   }
 
   type DailyClockIn {
-  date: String!
-  count: Int!
+    date: String!
+    count: Int!
   }
 
   type StaffStats {
@@ -43,14 +57,16 @@ const typeDefs = gql`
   }
 
   type Setting {
-  id: Int!
-  name: String!
-  value: String!
+    id: Int!
+    name: String!
+    value: String!
   }
 
   type Query {
+    ping: Boolean!
     users: [User!]!
-    clockEvents(userId: Int!): [ClockEvent!]!
+    clockEvents(userId: Int!, limit: Int): [ClockEvent!]!
+    todayClockIns: [ClockEvent!]!
     currentlyClockedIn: [User!]!
     dailyClockInCount: [DailyClockIn!]!
     staffClockStats: [StaffStats!]!
@@ -67,85 +83,88 @@ const typeDefs = gql`
     createUserIfNotExists(name: String!, email: String!): User!
     updateSetting(name: String!, value: String!): Setting!
   }
-
-  type TodayClockIn {
-  user: User
-  clockInTime: String
-  clockOutTime: String
-  latitude: Float
-  longitude: Float
-  }
-
 `;
 
 const resolvers = {
   Query: {
+    // NEW: touches the database, so the frontend can wake Neon up early
+    ping: async () => {
+      await prisma.$queryRaw`SELECT 1`;
+      return true;
+    },
+
     getSetting: (_, { name }) => prisma.setting.findUnique({ where: { name } }),
     users: () => prisma.user.findMany(),
 
-    clockEvents: (_, { userId }) =>
-      prisma.clockEvent.findMany({ where: { userId } }),
+    // CHANGED: newest first, and an optional limit
+    clockEvents: (_, { userId, limit }) =>
+      prisma.clockEvent.findMany({
+        where: { userId },
+        orderBy: { timestamp: 'desc' },
+        ...(limit ? { take: limit } : {}),
+      }),
 
+    // NEW: the manager dashboard asks for this. Every event since midnight IST.
+    todayClockIns: () =>
+      prisma.clockEvent.findMany({
+        where: { timestamp: { gte: startOfTodayIST() } },
+        orderBy: { timestamp: 'desc' },
+      }),
+
+    // CHANGED: uses each person's latest event from the last 24 hours, so night
+    // shifts that started yesterday still show up as "on shift"
     currentlyClockedIn: async () => {
-      const startOfToday = new Date();
-      startOfToday.setHours(0, 0, 0, 0);
-
+      const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
       const users = await prisma.user.findMany({
         include: {
           clockEvents: {
-            where: {
-              timestamp: { gte: startOfToday },
-            },
+            where: { timestamp: { gte: since } },
             orderBy: { timestamp: 'desc' },
+            take: 1,
           },
         },
       });
-
-      const clockedInUsers = users.filter(user => {
-        const todayEvents = user.clockEvents;
-        return todayEvents.length > 0 && todayEvents[0].type === 'IN';
-      });
-
-      return clockedInUsers;
+      return users.filter((u) => u.clockEvents[0]?.type === 'IN');
     },
 
-dailyClockInCount: async (_, __, { prisma }) => {
-  const result = await prisma.$queryRaw`
-    SELECT 
-      TO_CHAR((timestamp AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')::date, 'YYYY-MM-DD') AS date,
-      COUNT(DISTINCT "userId")::int AS count
-    FROM "ClockEvent"
-    WHERE type = 'IN'
-      AND (timestamp AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') >= (CURRENT_DATE - interval '6 days')
-    GROUP BY date
-    ORDER BY date DESC;
-  `;
+    dailyClockInCount: async (_, __, { prisma }) => {
+      const result = await prisma.$queryRaw`
+        SELECT 
+          TO_CHAR((timestamp AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')::date, 'YYYY-MM-DD') AS date,
+          COUNT(DISTINCT "userId")::int AS count
+        FROM "ClockEvent"
+        WHERE type = 'IN'
+          AND (timestamp AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') >= (CURRENT_DATE - interval '6 days')
+        GROUP BY date
+        ORDER BY date DESC;
+      `;
 
-  // Reverse to show oldest first
-  return result.map(r => ({
-    date: r.date,
-    count: Number(r.count) // ensure it's an actual JS integer
-  })).reverse();
-},
+      // Reverse to show oldest first
+      return result
+        .map((r) => ({ date: r.date, count: Number(r.count) }))
+        .reverse();
+    },
 
+    // CHANGED: one database query instead of one per person (much faster),
+    // and the average is 0 (not 1) when someone has no shifts
     staffClockStats: async () => {
       const users = await prisma.user.findMany();
-      const today = new Date();
-      const weekAgo = subDays(today, 7);
+      const weekAgo = subDays(new Date(), 7);
 
-      const stats = [];
+      const all = await prisma.clockEvent.findMany({
+        where: { timestamp: { gte: weekAgo } },
+        orderBy: { timestamp: 'asc' },
+      });
+      const byUser = {};
+      all.forEach((e) => {
+        if (!byUser[e.userId]) byUser[e.userId] = [];
+        byUser[e.userId].push(e);
+      });
 
-      for (const user of users) {
-        const events = await prisma.clockEvent.findMany({
-          where: {
-            userId: user.id,
-            timestamp: { gte: weekAgo, lte: today },
-          },
-          orderBy: { timestamp: 'asc' },
-        });
-
+      return users.map((user) => {
+        const events = byUser[user.id] || [];
         let totalHours = 0;
-        let dailyLogs = {};
+        const dailyLogs = {};
 
         for (let i = 0; i < events.length; i++) {
           if (events[i].type === 'IN' && events[i + 1]?.type === 'OUT') {
@@ -154,22 +173,21 @@ dailyClockInCount: async (_, __, { prisma }) => {
             const hours = (outTime - inTime) / (1000 * 60 * 60);
             totalHours += hours;
 
-            const day = inTime.toISOString().slice(0, 10);
+            const day = new Date(inTime.getTime() + IST_OFFSET_MS).toISOString().slice(0, 10);
             dailyLogs[day] = (dailyLogs[day] || 0) + hours;
             i++; // skip next OUT event
           }
         }
 
-        stats.push({
+        const days = Object.keys(dailyLogs).length;
+        return {
           userId: user.id,
           name: user.name,
           totalHoursLastWeek: parseFloat(totalHours.toFixed(2)),
-          avgDailyHours: parseFloat((totalHours / Object.keys(dailyLogs).length || 1).toFixed(2)),
-          daysPresent: Object.keys(dailyLogs).length,
-        });
-      }
-
-      return stats;
+          avgDailyHours: days ? parseFloat((totalHours / days).toFixed(2)) : 0,
+          daysPresent: days,
+        };
+      });
     },
 
     getUserByEmail: async (_, { email }) => {
@@ -194,44 +212,40 @@ dailyClockInCount: async (_, __, { prisma }) => {
     createUser: (_, args) => prisma.user.create({ data: args }),
 
     updateUserRole: async (_, { userId, role }) => {
-    return prisma.user.update({
-    where: { id: userId },
-    data: { role },
-    });
-  },
+      return prisma.user.update({
+        where: { id: userId },
+        data: { role },
+      });
+    },
 
     deleteUser: async (_, { userId }) => {
-    await prisma.user.delete({ where: { id: userId } });
-    return true;
-  },
+      await prisma.user.delete({ where: { id: userId } });
+      return true;
+    },
 
     clockIn: (_, { userId, note, latitude, longitude }) =>
       prisma.clockEvent.create({
         data: { userId, note, type: 'IN', latitude, longitude },
       }),
 
-clockOut: async (_, { userId, note, latitude, longitude }) => {
-  console.log(">>> clockOut resolver called with:", { userId, note, latitude, longitude });
+    clockOut: async (_, { userId, note, latitude, longitude }) => {
+      try {
+        return await prisma.clockEvent.create({
+          data: { userId, note, type: 'OUT', latitude, longitude },
+        });
+      } catch (error) {
+        console.error('❌ Error during clockOut:', error);
+        throw new Error('Failed to clock out.');
+      }
+    },
 
-  try {
-    const result = await prisma.clockEvent.create({
-      data: { userId, note, type: 'OUT', latitude, longitude },
-    });
-    console.log(">>> Clock out success:", result);
-    return result;
-  } catch (error) {
-    console.error("❌ Error during clockOut:", error);
-    throw new Error("Failed to clock out.");
-  }
-},
-updateSetting: async (_, { name, value }) => {
-    return prisma.setting.upsert({
-      where: { name },
-      update: { value },
-      create: { name, value },
-    });
-  },
-
+    updateSetting: async (_, { name, value }) => {
+      return prisma.setting.upsert({
+        where: { name },
+        update: { value },
+        create: { name, value },
+      });
+    },
   },
 
   ClockEvent: {
@@ -244,8 +258,6 @@ async function testDatabaseConnection() {
   try {
     await prisma.$connect();
     console.log('✅ Database connected successfully');
-    
-    // Test a simple query
     const userCount = await prisma.user.count();
     console.log(`📊 Database has ${userCount} users`);
   } catch (error) {
@@ -260,34 +272,22 @@ async function startServer() {
     console.log('🚀 Starting server...');
     console.log('📍 Environment:', process.env.NODE_ENV || 'development');
     console.log('🔗 Port:', process.env.PORT || 4000);
-    
-    // Test database connection first
+
     await testDatabaseConnection();
-    
-    // Create Apollo Server
+
     const server = new ApolloServer({
       typeDefs,
       resolvers,
-      context: ({ req }) => ({
-        prisma,
-      }),
+      context: () => ({ prisma }),
       cors: {
         origin: function (origin, callback) {
-          console.log('🌐 CORS Origin check:', origin);
-          
           // Allow requests with no origin (mobile apps, server-to-server)
-          if (!origin) {
-            console.log('✅ No origin - allowing request');
-            return callback(null, true);
-          }
-          
-          // Check if origin is allowed
+          if (!origin) return callback(null, true);
+
           if (allowedOrigins.includes(origin)) {
-            console.log('✅ Origin allowed:', origin);
             callback(null, true);
           } else {
-            console.log('❌ Origin blocked:', origin);
-            console.log('📋 Allowed origins:', allowedOrigins);
+            console.log('❌ Origin blocked:', origin, '| allowed:', allowedOrigins.join(', '));
             callback(null, false);
           }
         },
@@ -299,8 +299,8 @@ async function startServer() {
           'Content-Type',
           'Accept',
           'Authorization',
-          'Apollo-Require-Preflight'
-        ]
+          'Apollo-Require-Preflight',
+        ],
       },
       introspection: true,
       playground: process.env.NODE_ENV !== 'production',
@@ -314,16 +314,13 @@ async function startServer() {
       },
     });
 
-    // Start the server
-    const { url } = await server.listen({ 
+    const { url } = await server.listen({
       port: process.env.PORT || 4000,
-      host: '0.0.0.0' // Important for Render deployment
+      host: '0.0.0.0', // Important for Render deployment
     });
-    
+
     console.log('🎉 Server ready at:', url);
     console.log('📱 Allowed origins:', allowedOrigins.join(', '));
-    console.log('🔧 GraphQL Playground:', process.env.NODE_ENV !== 'production' ? 'enabled' : 'disabled');
-    
   } catch (error) {
     console.error('💥 Failed to start server:', error);
     process.exit(1);
@@ -343,12 +340,10 @@ process.on('SIGINT', async () => {
   process.exit(0);
 });
 
-// Handle unhandled promise rejections
 process.on('unhandledRejection', (reason, promise) => {
   console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
-// Handle uncaught exceptions
 process.on('uncaughtException', (error) => {
   console.error('❌ Uncaught Exception:', error);
   process.exit(1);
